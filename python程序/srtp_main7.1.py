@@ -188,6 +188,31 @@ def compute_event_indices(num_intermediate_targets):
     return join_idx, dropout_idx
 
 
+def enforce_min_distance(positions, min_dist=0.5, max_iterations=200):
+    """Push apart any pair of positions that are closer than min_dist."""
+    positions = np.array(positions, dtype=float)
+    n = len(positions)
+    for _ in range(max_iterations):
+        moved = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                diff = positions[i] - positions[j]
+                dist = np.linalg.norm(diff)
+                if dist < min_dist:
+                    if dist < 1e-9:
+                        diff = np.random.randn(2)
+                        diff /= np.linalg.norm(diff)
+                    else:
+                        diff /= dist
+                    correction = (min_dist - dist) / 2.0 * diff
+                    positions[i] += correction
+                    positions[j] -= correction
+                    moved = True
+        if not moved:
+            break
+    return positions
+
+
 def build_wait_position(join_center, wait_offset=(1.5, 1.0)):
     return np.asarray(join_center, dtype=float) + np.asarray(wait_offset, dtype=float)
 
@@ -362,6 +387,7 @@ class FormationController:
         optimized_targets = np.asarray(optimized_targets, dtype=float)
         if optimized_targets.shape != base_targets.shape:
             optimized_targets = base_targets
+        optimized_targets = enforce_min_distance(optimized_targets, min_dist=0.5)
 
         self.current_target_positions = optimized_targets
         self.target_index_by_vehicle_id = {
@@ -369,13 +395,14 @@ class FormationController:
         }
 
     def all_active_vehicles_arrived(self):
-        if len(self.current_target_positions) != len(self.formation_vehicle_ids):
+        if len(self.current_target_positions) == 0:
             return False
-        for vehicle_id in self.formation_vehicle_ids:
-            target = self.current_target_positions[self.target_index_by_vehicle_id[vehicle_id]]
-            if np.linalg.norm(self.vehicles[vehicle_id].position - target) > self.vehicles[vehicle_id].arrival_threshold:
-                return False
-        return True
+        current_center = np.mean(
+            [self.vehicles[vid].position for vid in self.formation_vehicle_ids], axis=0
+        )
+        target_center = np.mean(self.current_target_positions, axis=0)
+        threshold = self.vehicles[self.formation_vehicle_ids[0]].arrival_threshold
+        return np.linalg.norm(current_center - target_center) < threshold
 
     def trigger_join_wait(self):
         self.state = "join_wait"
@@ -387,12 +414,7 @@ class FormationController:
 
     def finalize_join(self):
         self.state = "five_car_cruise"
-        if self.current_waypoint_index < len(self.waypoint_centers) - 1:
-            self.current_waypoint_index += 1
-            self.recompute_current_targets()
-        else:
-            self.navigation_complete = True
-            self.state = "navigation_complete"
+        self._advance_to_next_waypoint()
 
     def trigger_dropout(self):
         dropout_car = self.vehicles[self.waiting_vehicle_id]
@@ -401,13 +423,75 @@ class FormationController:
         dropout_car.velocity = np.zeros(2)
         self.formation_vehicle_ids = [0, 1, 2, 3]
         self.state = "dropout_done"
+        self._advance_to_next_waypoint()
 
-        if self.current_waypoint_index < len(self.waypoint_centers) - 1:
-            self.current_waypoint_index += 1
-            self.recompute_current_targets()
-        else:
+    def _advance_to_next_waypoint(self):
+        """5.1-style advance: pre-compute targets for next waypoint, insert intermediate
+        if the optimizer shifts the formation centre by more than OPTIMIZATION_THRESHOLD."""
+        _OPTIMIZATION_THRESHOLD = 0.5
+
+        if self.current_waypoint_index >= len(self.waypoint_centers) - 1:
             self.navigation_complete = True
             self.state = "navigation_complete"
+            return
+
+        # Forward vector from current waypoint toward the next (index not yet advanced)
+        forward_vector = self.compute_forward_vector()
+        for vid in self.formation_vehicle_ids:
+            self.vehicles[vid].forward_vector = tuple(forward_vector)
+
+        # Safe region at the current (arrived) position
+        current_car_info = self.build_current_car_info()
+        try:
+            new_safe = safe_region(
+                [current_car_info, OBSTACLES],
+                forward_vector=forward_vector,
+                formation_erosion=False,
+            )
+        except Exception:
+            new_safe = np.array(current_car_info)[:, :2] if current_car_info else np.empty((0, 2))
+
+        self.safe_regions.append(new_safe)
+        if len(self.safe_regions) > 1:
+            self.safe_regions.pop(0)
+
+        next_idx = self.current_waypoint_index + 1
+        next_center = self.waypoint_centers[next_idx]
+        offsets = self.get_current_offsets()
+        base_targets = expand_to_formation(next_center, offsets)
+        active_positions = self.get_active_positions()
+
+        optimized_targets = solve_optimization(
+            new_safe,
+            base_targets,
+            active_positions,
+            self.get_current_adj_matrix(),
+            self.current_waypoint_index,
+            self.get_current_shape_icon(),
+            forward_vector,
+        )
+        optimized_targets = np.asarray(optimized_targets, dtype=float)
+        if optimized_targets.shape != base_targets.shape:
+            optimized_targets = base_targets
+
+        # Enforce minimum pairwise distance >= 0.5
+        optimized_targets = enforce_min_distance(optimized_targets, min_dist=0.5)
+
+        # 5.1 insertion logic: if optimizer shifts centre too far, insert intermediate waypoint
+        opt_center = np.mean(optimized_targets, axis=0)
+        orig_center = np.mean(base_targets, axis=0)  # equals next_center
+        if np.linalg.norm(opt_center - orig_center) > _OPTIMIZATION_THRESHOLD:
+            self.waypoint_centers.insert(next_idx, opt_center.copy())
+            if self.join_waypoint_index >= next_idx:
+                self.join_waypoint_index += 1
+            if self.dropout_waypoint_index >= next_idx:
+                self.dropout_waypoint_index += 1
+
+        self.current_waypoint_index = next_idx
+        self.current_target_positions = optimized_targets
+        self.target_index_by_vehicle_id = {
+            vid: idx for idx, vid in enumerate(self.formation_vehicle_ids)
+        }
 
     def handle_waypoint_arrival(self):
         current_center = np.mean(self.get_active_positions(), axis=0)
@@ -426,8 +510,7 @@ class FormationController:
             return
 
         if self.current_waypoint_index < len(self.waypoint_centers) - 1:
-            self.current_waypoint_index += 1
-            self.recompute_current_targets()
+            self._advance_to_next_waypoint()
             return
 
         self.navigation_complete = True
