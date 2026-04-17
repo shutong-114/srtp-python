@@ -8,7 +8,9 @@ from scipy.spatial import ConvexHull
 
 from LF2_2 import safe_region
 from a_star_lib_v_5 import a_star_path
-from distributed_optimization_operator import DistributedFormationOptimizer
+from distributed_optimization_operator_repulsion import (
+    DistributedFormationOptimizerWithRepulsion as DistributedFormationOptimizer,
+)
 from rvo import compute_RVO_velocity
 
 
@@ -252,7 +254,10 @@ def solve_optimization(
         )
         compute_effective_width(width_region, target_center, n_vector, formation_radius, vehicle_radius)
 
-        optimizer = DistributedFormationOptimizer(formation_icon, sigma=0.2, max_iter=5000, tol=1e-2, eta=0.2)
+        optimizer = DistributedFormationOptimizer(
+            formation_icon, sigma=0.2, max_iter=5000, tol=1e-2, eta=0.2,
+            min_dist=0.5, repulsion_inner_iters=20, repulsion_every=1,
+        )
         optimized = optimizer.optimize_distributed(
             initial_positions=np.tile(target_center, (active_count, 1)),
             LF_vertices=LF_vertices,
@@ -387,7 +392,6 @@ class FormationController:
         optimized_targets = np.asarray(optimized_targets, dtype=float)
         if optimized_targets.shape != base_targets.shape:
             optimized_targets = base_targets
-        optimized_targets = enforce_min_distance(optimized_targets, min_dist=0.5)
 
         self.current_target_positions = optimized_targets
         self.target_index_by_vehicle_id = {
@@ -473,9 +477,6 @@ class FormationController:
         optimized_targets = np.asarray(optimized_targets, dtype=float)
         if optimized_targets.shape != base_targets.shape:
             optimized_targets = base_targets
-
-        # Enforce minimum pairwise distance >= 0.5
-        optimized_targets = enforce_min_distance(optimized_targets, min_dist=0.5)
 
         # 5.1 insertion logic: if optimizer shifts centre too far, insert intermediate waypoint
         opt_center = np.mean(optimized_targets, axis=0)
