@@ -33,6 +33,14 @@ class DistributedFormationOptimizerWithRepulsion(DistributedFormationOptimizer):
         每次调用斥力修正时的最大内层迭代次数，默认 20。
     repulsion_every : int
         每隔多少次外层优化迭代执行一次斥力修正，默认 1（每次都执行）。
+    min_iter : int
+        最小迭代次数（避免过快收敛），默认 50。
+    formation_tol : float
+        队形误差收敛阈值，默认 1e-3。
+    consensus_tol : float
+        一致性误差收敛阈值，默认 1e-3。
+    stable_steps : int
+        连续满足所有收敛条件的步数，默认 5。
     """
 
     def __init__(
@@ -45,11 +53,21 @@ class DistributedFormationOptimizerWithRepulsion(DistributedFormationOptimizer):
         min_dist=0.5,
         repulsion_inner_iters=20,
         repulsion_every=1,
+        min_iter=50,
+        formation_tol=1e-3,
+        consensus_tol=1e-3,
+        stable_steps=5,
     ):
         super().__init__(shape_icon, sigma, max_iter, tol, eta)
         self.min_dist = min_dist
         self.repulsion_inner_iters = repulsion_inner_iters
         self.repulsion_every = repulsion_every
+        self.min_iter = min_iter
+        self.formation_tol = formation_tol
+        self.consensus_tol = consensus_tol
+        self.stable_steps = stable_steps
+        self.formation_error_history = []
+        self.consensus_error_history = []
 
     # ------------------------------------------------------------------
     # 核心：斥力修正 + LF 重投影
@@ -110,8 +128,10 @@ class DistributedFormationOptimizerWithRepulsion(DistributedFormationOptimizer):
           1. Snapshot（深拷贝当前 positions / estimates / dual_vars / L）
           2. 用 snapshot 并行计算所有机器人的更新量（不立即写回）
           3. 一次性写回所有更新量
-          4. （每 repulsion_every 次）对 self.positions 施加斥力修正并重投影
-          5. 收敛检测（以写回后未经斥力修正的位移量为基准，避免斥力干扰判断）
+          4. 记录一次纯优化的位移量 max_change（用于收敛判断）
+          5. （每 repulsion_every 次）对 self.positions 施加斥力修正并重投影
+          6. 收敛检测：在满足最小迭代次数的前提下，同时满足
+             max_change / formation_error / consensus_error 阈值并连续稳定 stable_steps 次
 
         注意：斥力只修改 self.positions（真实位置），self.estimates 通过后续
         迭代的一致性项自动向正确值收敛，无需强制同步。
@@ -122,6 +142,7 @@ class DistributedFormationOptimizerWithRepulsion(DistributedFormationOptimizer):
         B_matrices = self._build_distributed_constraints()
         self.convergence_history = []
 
+        stable_count = 0
         for k in range(self.max_iter):
             # 1. Snapshot
             positions_snap = {i: self.positions[i].copy() for i in self.positions}
@@ -167,11 +188,7 @@ class DistributedFormationOptimizerWithRepulsion(DistributedFormationOptimizer):
                     self.dual_vars[i]['z_i1'] = upd['z_i1']
                     self.dual_vars[i]['w_i2'] = upd['w_i2']
 
-            # 4. 内嵌斥力修正 + LF 重投影
-            if (k + 1) % self.repulsion_every == 0:
-                self._apply_repulsion_and_project(LF_vertices)
-
-            # 5. 收敛检测（以未经斥力修正的纯优化位移量为基准）
+            # 4. 记录纯优化位移量（未施加斥力）
             max_change = 0.0
             for i in range(1, self.m + 1):
                 change = np.linalg.norm(self.positions[i] - positions_snap[i])
@@ -179,8 +196,34 @@ class DistributedFormationOptimizerWithRepulsion(DistributedFormationOptimizer):
                     max_change = change
             self.convergence_history.append(max_change)
 
-            if max_change < self.tol:
-                print(f"[RepulsionOptimizer] 在第 {k} 次迭代收敛")
+            # 5. 内嵌斥力修正 + LF 重投影
+            if (k + 1) % self.repulsion_every == 0:
+                self._apply_repulsion_and_project(LF_vertices)
+
+            # 6. 收敛检测（多指标 + 最小迭代次数 + 稳定步数）
+            formation_error = self.get_formation_error()
+            consensus_error = self.get_consensus_error()
+            self.formation_error_history.append(formation_error)
+            self.consensus_error_history.append(consensus_error)
+
+            meets_criteria = (
+                (k + 1) >= self.min_iter
+                and max_change < self.tol
+                and formation_error < self.formation_tol
+                and consensus_error < self.consensus_tol
+            )
+            if meets_criteria:
+                stable_count += 1
+            else:
+                stable_count = 0
+
+            if stable_count >= self.stable_steps:
+                print(
+                    f"[RepulsionOptimizer] 在第 {k} 次迭代收敛 "
+                    f"(max_change={max_change:.3e}, "
+                    f"formation_error={formation_error:.3e}, "
+                    f"consensus_error={consensus_error:.3e})"
+                )
                 break
 
         return self.positions

@@ -255,8 +255,9 @@ def solve_optimization(
         compute_effective_width(width_region, target_center, n_vector, formation_radius, vehicle_radius)
 
         optimizer = DistributedFormationOptimizer(
-            formation_icon, sigma=0.2, max_iter=5000, tol=1e-2, eta=0.2,
+            formation_icon, sigma=0.2, max_iter=5000, tol=1e-3, eta=0.2,
             min_dist=0.5, repulsion_inner_iters=20, repulsion_every=1,
+            min_iter=100, formation_tol=1e-3, consensus_tol=1e-3, stable_steps=5,
         )
         optimized = optimizer.optimize_distributed(
             initial_positions=np.tile(target_center, (active_count, 1)),
